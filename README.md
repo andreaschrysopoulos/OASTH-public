@@ -1,67 +1,123 @@
-# OASTH map app
+# OASTH Map App
 
-React + Vite frontend with a small Express proxy to [OASTH telematics](https://telematics.oasth.gr) (session cookie + CSRF; no Playwright at runtime).
+Interactive map and arrivals app for Thessaloniki bus data, built with React, Vite, and a small Express proxy for the OASTH telematics endpoints.
 
-## Project structure
+## Overview
+
+The project has two parts:
+
+- A React client that renders the map UI and bus-stop experience
+- An Express server that proxies OASTH telematics requests and serves the built app in production
+
+The proxy exists so the browser does not need to deal directly with the upstream session and CSRF flow used by the OASTH telematics API.
+
+## Stack
+
+- React 19
+- Vite
+- Express 5
+- Mapbox GL via `react-map-gl`
+
+## Project Structure
 
 ```text
-OASTH/
+OASTH-public/
   public/                  Static client assets
   server/                  Express proxy entrypoint
   src/
-    app/                   React app shell and entry boundary
+    app/                   React app shell and main UI
     shared/                Logic shared by client and server
     styles/                Global client styles
 ```
 
-## Setup
+## Quick Start
+
+### 1. Install dependencies
 
 ```bash
-cd OASTH
 npm install
-cp .env.example .env
-# Then set VITE_MAPBOX_ACCESS_TOKEN in .env (Mapbox public token, pk.…)
 ```
 
-Keep `.env` local only. The repository includes `.env.example` as the safe template to commit.
-
-## Development
-
-Two terminals:
+### 2. Create your local env file
 
 ```bash
-npm run server   # API proxy → http://localhost:3001
-npm run dev      # Vite → http://localhost:5173 (proxies /api to 3001)
+cp .env.example .env
 ```
+
+Set `VITE_MAPBOX_ACCESS_TOKEN` in `.env` to a Mapbox public token that starts with `pk.`.
+
+`.env` stays local and should not be committed. The committed template is [`.env.example`](./.env.example).
+
+### 3. Run the app locally
+
+Use two terminals:
+
+```bash
+npm run server
+```
+
+```bash
+npm run dev
+```
+
+Local URLs:
+
+- App: `http://localhost:5173`
+- API proxy: `http://localhost:3001`
+
+Vite proxies `/api` requests to the local Express server during development.
 
 ## Production
 
-Build the UI, then run Node with `NODE_ENV=production` so the same process serves `dist/` and `/api/*`:
+Build the frontend and run the Node server in production mode:
 
 ```bash
 npm run build
 NODE_ENV=production npm start
 ```
 
-Most PaaS set `NODE_ENV=production` for you when running `npm start`.
+In production, the same Express process serves:
 
-- Default port: **3001** (override with `PORT`).
-- **Health check:** `GET /health` → `{ "ok": true }`.
-- If `dist/` is missing in production, only the API is served (a warning is logged).
-- **Page password (optional):** set `PAGE_PASSWORD` in the environment. The Express server then requires a successful `POST /api/auth/page-login` (sets an httpOnly cookie) before `/api/*` and the static SPA are served. Omit `PAGE_PASSWORD` for open access (typical local dev).
+- The built frontend from `dist/`
+- The `/api/*` proxy endpoints
+- `GET /health` for a simple health check
 
-### CORS
+If `dist/` is missing, the server still starts but only the API is available.
 
-- Same host (recommended): do **not** set `CORS_ORIGIN`; the server disables permissive CORS in production.
-- Split hosting (e.g. static on a CDN): set `CORS_ORIGIN` to your site origin(s), comma-separated.
+## Environment Variables
 
-### Environment variables
-
-| Variable | Where | Purpose |
-|----------|--------|---------|
-| `VITE_MAPBOX_ACCESS_TOKEN` | build time | Mapbox GL token |
-| `VITE_MAPBOX_STYLE` | build time | Optional map style URL |
-| `PORT` | runtime | Listen port (default 3001) |
-| `NODE_ENV` | runtime | Use `production` for static + hardened errors |
-| `CORS_ORIGIN` | runtime | Browser origins if API is on another host |
+| Variable | When used | Purpose |
+|----------|-----------|---------|
+| `VITE_MAPBOX_ACCESS_TOKEN` | build time | Required Mapbox public token for the map |
+| `VITE_MAPBOX_STYLE` | build time | Optional custom Mapbox style URL |
+| `PORT` | runtime | Express port, defaults to `3001` |
+| `NODE_ENV` | runtime | Set to `production` for static asset serving and production behavior |
+| `CORS_ORIGIN` | runtime | Optional allowed origin or comma-separated origins when frontend and API are hosted separately |
 | `PAGE_PASSWORD` | runtime | Optional password gate for the whole app |
+| `OASTH_LEGACY_ROUTE_POLE_MAP` | runtime | Optional fallback route-stop mapping mode |
+| `OASTH_FETCH_TIMEOUT_MS` | runtime | Optional upstream request timeout override |
+| `OASTH_FETCH_RETRIES` | runtime | Optional number of retry attempts for upstream fetches |
+| `OASTH_FETCH_RETRY_BASE_MS` | runtime | Optional base delay for upstream fetch retries |
+
+## Page Password
+
+If `PAGE_PASSWORD` is set, the server requires a successful `POST /api/auth/page-login` before serving the full app experience. This is optional and is mainly useful for private deployments.
+
+If `PAGE_PASSWORD` is not set, the app is open as usual.
+
+## Deployment Notes
+
+- Same-host deployment is the simplest setup: serve the frontend and API from the same Node process.
+- If you split the frontend and API across different hosts, set `CORS_ORIGIN` to the frontend origin.
+- Many hosting providers already set `NODE_ENV=production` when running `npm start`.
+
+## Scripts
+
+| Command | Purpose |
+|---------|---------|
+| `npm run dev` | Start the Vite development server |
+| `npm run server` | Start the Express API proxy |
+| `npm run build` | Create a production frontend build |
+| `npm start` | Start the Express server |
+| `npm run lint` | Run ESLint |
+| `npm run preview` | Preview the Vite production build |
