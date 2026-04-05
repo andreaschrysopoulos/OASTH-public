@@ -395,10 +395,13 @@ body {
   will-change: opacity, transform;
 }
 
-.mobile-sheet-body > * {
+.mobile-sheet-body-content {
   flex: 1;
   min-height: 0;
   width: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 /* Map chrome — frosted circle (simple, Maps-like)
@@ -1524,6 +1527,31 @@ button.stop-popup-title-hit {
   flex-shrink: 0;
   width: 100%;
   margin-bottom: 10px;
+}
+
+.map-left-sidebar-disclaimer {
+  margin: 0;
+  padding: 0;
+  color: var(--text-secondary);
+  font-size: 0.64rem;
+  line-height: 1.35;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+.map-left-sidebar-disclaimer--footer {
+  flex-shrink: 0;
+  margin-top: 12px;
+  padding: 0 12px 0;
+  border-top: none;
+  text-align: left;
+}
+
+.map-left-sidebar-disclaimer--mobile-footer {
+  flex-shrink: 0;
+  margin-top: 10px;
+  padding: 0 2px 0 2px;
+  text-align: center;
 }
 
 .map-left-sidebar-search-recent {

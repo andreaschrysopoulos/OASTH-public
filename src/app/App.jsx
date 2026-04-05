@@ -2620,6 +2620,17 @@ function MobileRecentLinesSection({
   )
 }
 
+function SidebarDisclaimer({ className = '' }) {
+  return (
+    <p
+      className={`map-left-sidebar-disclaimer${className ? ` ${className}` : ''}`}
+      role="note"
+    >
+      Not affiliated with OASTH
+    </p>
+  )
+}
+
 /** Filter for the all-lines panel: empty shows all; otherwise published line number only. */
 function lineRowMatchesBrowseFilter(queryRaw, row) {
   const t = String(queryRaw ?? '').trim()
@@ -3938,7 +3949,8 @@ function MobileBrowseSheet({
             'mobile-sheet-body' + (bodyClassName ? ` ${bodyClassName}` : '')
           }
         >
-          {children}
+          <div className="mobile-sheet-body-content">{children}</div>
+          <SidebarDisclaimer className="map-left-sidebar-disclaimer--mobile-footer" />
         </div>
       ) : null}
     </div>
@@ -7325,6 +7337,7 @@ export default function App() {
                   onHomeSearchActiveChange={setHomeSearchHeaderActive}
                   currentTrackedRouteCode={String(liveTracking?.routeCode ?? '').trim()}
                 />
+                <SidebarDisclaimer className="map-left-sidebar-disclaimer--footer" />
               </div>
             </>
           ) : null}
