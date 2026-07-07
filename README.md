@@ -94,10 +94,18 @@ If `dist/` is missing, the server still starts but only the API is available.
 | `NODE_ENV` | runtime | Set to `production` for static asset serving and production behavior |
 | `CORS_ORIGIN` | runtime | Optional allowed origin or comma-separated origins when frontend and API are hosted separately |
 | `PAGE_PASSWORD` | runtime | Optional password gate for the whole app |
-| `OASTH_LEGACY_ROUTE_POLE_MAP` | runtime | Optional fallback route-stop mapping mode |
+| `OSETH_BASE` | runtime | Optional OSETH API base URL override, defaults to `https://oseth.com.gr` |
+| `OSETH_LANGUAGE` | runtime | Optional OSETH language, `el` by default; set `en` for English |
+| `OSETH_ROUTE_PAGE_SIZE` | runtime | Optional OSETH route page size, defaults to `500` |
+| `OSETH_STOP_PAGE_SIZE` | runtime | Optional OSETH stop page size, defaults to `1000` |
+| `OASTH_LEGACY_FALLBACK` | runtime | Opt-in legacy OASTH fallback switch. Disabled by default; set `1` only to call old telematics endpoints when OSETH cannot serve a request |
+| `OASTH_LEGACY_ROUTE_POLE_MAP` | runtime | Requires `OASTH_LEGACY_FALLBACK=1`; optional legacy route-stop pole mapping crawl |
+| `OASTH_LEGACY_GET_STOPS_B_POLE_MAP` | runtime | Requires `OASTH_LEGACY_FALLBACK=1`; optional legacy `getStopsB` pole mapping |
 | `OASTH_FETCH_TIMEOUT_MS` | runtime | Optional upstream request timeout override |
 | `OASTH_FETCH_RETRIES` | runtime | Optional number of retry attempts for upstream fetches |
 | `OASTH_FETCH_RETRY_BASE_MS` | runtime | Optional base delay for upstream fetch retries |
+
+By default, the API proxy uses OSETH endpoints only. The old OASTH telematics API remains available as an explicit fallback for emergency/debug use, but it is not called unless `OASTH_LEGACY_FALLBACK=1` is set.
 
 ## Page Password
 

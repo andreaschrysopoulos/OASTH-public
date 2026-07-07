@@ -1,4 +1,5 @@
 import {
+  Fragment,
   memo,
   useEffect,
   useLayoutEffect,
@@ -635,7 +636,7 @@ async function fetchArrivals(stopCode) {
       data && typeof data.error === 'string' ? data.error : `HTTP ${res.status}`
     throw new Error(detail)
   }
-  return dedupeStopArrivals(Array.isArray(data) ? data : [])
+  return dedupeStopArrivals(Array.isArray(data) ? data : []).filter(arrivalIsLive)
 }
 
 const MAPBOX_TOKEN = import.meta.env.VITE_MAPBOX_ACCESS_TOKEN
@@ -1744,6 +1745,14 @@ function arrivalEtaMinutes(a) {
   return Number.isFinite(raw) && raw >= 0 ? raw : Number.POSITIVE_INFINITY
 }
 
+function arrivalIsLive(a) {
+  const kind = String(a?.__arrival_kind ?? '').trim().toLowerCase()
+  if (kind === 'live') return true
+  if (kind === 'scheduled') return false
+  if (a?.is_live === true || a?.realtime === true || a?.monitored === true) return true
+  return a?.__source !== 'oseth'
+}
+
 /** `webGetRoutes` row → arrival-shaped object for badge / direction helpers. */
 function routeRowToArrivalLikeForDisplay(row) {
   return {
@@ -1792,37 +1801,6 @@ function findRouteRowByCode(rows, routeCode) {
   return (
     rows.find((r) => routeCodesMatch(routeCodeFromRouteRow(r), routeCode)) ?? null
   )
-}
-
-function buildPlannedRouteCodeSet(arrivals, routesAtStop) {
-  const planned = new Set()
-  if (!Array.isArray(arrivals)) return planned
-  for (const a of arrivals) {
-    const embedded = String(a.resolved_route_code ?? '').trim()
-    if (embedded) {
-      planned.add(canonNumish(embedded))
-      continue
-    }
-    if (Array.isArray(routesAtStop) && routesAtStop.length > 0) {
-      const rc = resolveArrivalRouteCode(a, routesAtStop)
-      if (rc) planned.add(canonNumish(rc))
-    }
-  }
-  return planned
-}
-
-function unplannedRoutesAtStopList(routesAtStop, plannedCodes) {
-  if (!Array.isArray(routesAtStop) || routesAtStop.length === 0) return []
-  const seen = new Set()
-  const out = []
-  for (const r of routesAtStop) {
-    const ck = canonNumish(routeCodeFromRouteRow(r))
-    if (!ck || plannedCodes.has(ck)) continue
-    if (seen.has(ck)) continue
-    seen.add(ck)
-    out.push(r)
-  }
-  return out
 }
 
 /** `webRoutesForStop` row → shape `onSelectArrival` / `resolveRouteCodeForMap` understand. */
@@ -4046,26 +4024,27 @@ const StopPopupArrivalsRegion = memo(function StopPopupArrivalsRegion({
                 const a = group.primary
                 const badge = arrivalLineBadgeDisplay(a)
                 const dirLabel = arrivalDirectionLabel(a)
+                const timeItems = (Array.isArray(group.times) ? group.times : [])
+                  .filter((t) => Number.isFinite(t.mins) && t.mins >= 0)
                 const rowRouteCode = String(
                   a?.resolved_route_code ?? arrivalRouteRaw(a) ?? ''
                 ).trim()
                 const isSelectedRow =
                   Boolean(activeRouteCode) &&
                   routeCodesMatch(rowRouteCode, String(activeRouteCode))
-                const allTimes = [a, ...group.extras]
-                  .map((x) => Number.parseInt(String(x?.btime2 ?? '').trim(), 10))
-                  .filter((n) => Number.isFinite(n) && n >= 0)
-                const timeText = allTimes.join(', ')
-                const hasNow = allTimes.some((n) => n === 0)
+                const hasNow = timeItems.some((t) => t.mins === 0)
                 const timeAria = hasNow
-                  ? `Τώρα${allTimes.filter((n) => n !== 0).length ? `, ${allTimes.filter((n) => n !== 0).join(', ')}` : ''}`
-                  : timeText
+                  ? timeItems.map((t) => (t.mins === 0 ? 'Τώρα' : t.mins)).join(', ')
+                  : timeItems.map((t) => t.mins).join(', ')
                 return (
                   <li key={`g-${group.key}-${i}`}>
                     <button
                       type="button"
                       className={
                         'stop-popup-arrival-item' +
+                        (group.hasLive
+                          ? ' stop-popup-arrival-item--live'
+                          : ' stop-popup-arrival-item--scheduled') +
                         (isSelectedRow ? ' stop-popup-arrival-item--selected' : '')
                       }
                       onMouseDown={(e) => e.stopPropagation()}
@@ -4075,21 +4054,63 @@ const StopPopupArrivalsRegion = memo(function StopPopupArrivalsRegion({
                       }}
                       aria-label={`Εμφάνιση στο χάρτη: ${badge.title || badge.text || 'γραμμή'}`}
                     >
-                      <div className="stop-popup-route-badge" title={badge.title}>
+                      <div
+                        className={
+                          'stop-popup-route-badge' +
+                          (group.hasLive
+                            ? ' stop-popup-route-badge--live'
+                            : ' stop-popup-route-badge--scheduled')
+                        }
+                        title={badge.title}
+                      >
                         {badge.text}
                       </div>
                       <div className="stop-popup-direction" title={dirLabel}>
                         {dirLabel}
                       </div>
-                      <div className={`stop-popup-time ${stopPopupTimeColorClass(a.btime2)}`}>
-                        {hasNow && allTimes.length === 1 ? (
-                          <span className="time-now" lang="el">
+                      <div
+                        className={
+                          'stop-popup-time' +
+                          (group.hasLive ? '' : ' stop-popup-time--scheduled')
+                        }
+                      >
+                        {hasNow && timeItems.length === 1 ? (
+                          <span
+                            className={
+                              'time-now' +
+                              (timeItems[0]?.live
+                                ? ` ${stopPopupTimeColorClass(timeItems[0].mins)}`
+                                : ' time-val--scheduled')
+                            }
+                            lang="el"
+                          >
                             Τώρα
                           </span>
                         ) : (
                           <>
-                            <span className="time-val" aria-label={timeAria}>
-                              {timeText}
+                            <span className="time-values" aria-label={timeAria}>
+                              {timeItems.map((t, timeIndex) => (
+                                <Fragment key={`${t.mins}-${timeIndex}`}>
+                                  <span
+                                    className={
+                                      'time-val' +
+                                      (t.live
+                                        ? ` time-val--live ${stopPopupTimeColorClass(t.mins)}`
+                                        : ' time-val--scheduled')
+                                    }
+                                  >
+                                    {t.mins === 0 ? 'Τώρα' : t.mins}
+                                  </span>
+                                  {timeIndex < timeItems.length - 1 ? (
+                                    <span
+                                      className={`time-sep ${stopPopupTimeColorClass(t.mins)}`}
+                                      aria-hidden
+                                    >
+                                      ,{' '}
+                                    </span>
+                                  ) : null}
+                                </Fragment>
+                              ))}
                             </span>
                             <span className="time-unit" lang="el">
                               λεπ.
@@ -4180,16 +4201,9 @@ const StopPopupArrivalsRegion = memo(function StopPopupArrivalsRegion({
         </div>
       ) : (
         <div className="stop-popup-arrivals-viewport stop-popup-arrivals-viewport--center">
-          {unplannedRoutes.length > 0 && !showUnplannedRoutes ? (
-            <div className="stop-popup-no-data" lang="el">
-              Δεν υπάρχουν ζωντανές αφίξεις αυτή τη στιγμή. Υπάρχουν{' '}
-              {unplannedRoutes.length} γραμμές χωρίς διαθέσιμο χρόνο άφιξης.
-            </div>
-          ) : (
-            <div className="stop-popup-no-data" lang="el">
-              Από αυτή τη στάση δεν διέρχονται λεωφορεία.
-            </div>
-          )}
+          <div className="stop-popup-no-data" lang="el">
+            Δεν υπάρχουν παρακολουθούμενες αφίξεις αυτή τη στιγμή.
+          </div>
         </div>
       )}
     </div>
@@ -4773,24 +4787,27 @@ function StopMapPopup({
   }, [stop.id])
 
   const unplannedRoutes = useMemo(() => {
-    if (!Array.isArray(routesAtStop) || routesAtStop.length === 0) return []
-    const arr = Array.isArray(arrivals) ? arrivals : []
-    const planned = buildPlannedRouteCodeSet(arr, routesAtStop)
-    return unplannedRoutesAtStopList(routesAtStop, planned)
-  }, [arrivals, routesAtStop])
-  const hasOnlyUnplannedRoutes =
-    Array.isArray(arrivals) && arrivals.length === 0 && unplannedRoutes.length > 0
-  const visibleUnplannedRoutes = useMemo(
-    () => (hasOnlyUnplannedRoutes || showUnplannedRoutes ? unplannedRoutes : EMPTY_ARRAY),
-    [hasOnlyUnplannedRoutes, showUnplannedRoutes, unplannedRoutes]
-  )
+    return EMPTY_ARRAY
+  }, [])
+  const hasOnlyUnplannedRoutes = false
+  const visibleUnplannedRoutes = EMPTY_ARRAY
 
   const groupedArrivals = useMemo(() => {
     if (!Array.isArray(arrivals) || arrivals.length === 0) return []
+    const arrivalsWithMeta = arrivals.map((arrival, index) => ({
+      arrival,
+      index,
+      etaMins: arrivalEtaMinutes(arrival),
+      live: arrivalIsLive(arrival),
+    }))
+    const visibleArrivals = arrivalsWithMeta
+      .filter((x) => x.live)
+      .sort((a, b) => a.etaMins - b.etaMins || a.index - b.index)
     const byLine = new Map()
-    arrivals.forEach((a, index) => {
-      const lineKey = normalizeLineIdKey(arrivalLineBadge(a)) || `idx-${index}`
-      const withMeta = { arrival: a, index, etaMins: arrivalEtaMinutes(a) }
+    visibleArrivals.forEach((withMeta) => {
+      const lineKey =
+        normalizeLineIdKey(arrivalLineBadge(withMeta.arrival)) ||
+        `idx-${withMeta.index}`
       const existing = byLine.get(lineKey)
       if (existing) {
         existing.items.push(withMeta)
@@ -4801,19 +4818,34 @@ function StopMapPopup({
     return [...byLine.values()]
       .map((g) => {
         const items = [...g.items].sort(
-          (a, b) => a.etaMins - b.etaMins || a.index - b.index
+          (a, b) =>
+            Number(b.live) - Number(a.live) ||
+            a.etaMins - b.etaMins ||
+            a.index - b.index
         )
+        const hasLive = items.some((x) => x.live)
+        const firstLive = items.find((x) => x.live)
+        const firstItem = firstLive ?? items[0]
         return {
           key: g.key,
-          primary: items[0]?.arrival ?? null,
-          extras: items.slice(1).map((x) => x.arrival),
-          firstIndex: items[0]?.index ?? Number.POSITIVE_INFINITY,
-          firstEtaMins: items[0]?.etaMins ?? Number.POSITIVE_INFINITY,
+          primary: firstItem?.arrival ?? null,
+          times: items.map((x) => ({
+            arrival: x.arrival,
+            mins: x.etaMins,
+            live: x.live,
+          })),
+          hasLive,
+          extras: items
+            .filter((x) => x !== firstItem)
+            .map((x) => x.arrival),
+          firstIndex: firstItem?.index ?? Number.POSITIVE_INFINITY,
+          firstEtaMins: firstItem?.etaMins ?? Number.POSITIVE_INFINITY,
         }
       })
       .filter((g) => g.primary)
       .sort(
         (a, b) =>
+          Number(b.hasLive) - Number(a.hasLive) ||
           a.firstEtaMins - b.firstEtaMins || a.firstIndex - b.firstIndex
       )
   }, [arrivals])
@@ -4821,7 +4853,7 @@ function StopMapPopup({
   const showArrivalsListLayout =
     !error &&
     Array.isArray(arrivals) &&
-    (arrivals.length > 0 || unplannedRoutes.length > 0)
+    groupedArrivals.length > 0
 
   const holdArrivalsViewportDuringRefresh =
     arrivalsRefreshing && everHadArrivalsRef.current

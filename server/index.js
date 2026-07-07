@@ -1,6 +1,6 @@
 /**
- * OASTH Telematics API proxy + optional static SPA (production).
- * Uses Node fetch + PHPSESSID from webGetLangs — no Playwright at runtime.
+ * OSETH telematics API proxy + optional static SPA (production).
+ * Legacy OASTH telematics calls are disabled by default and require OASTH_LEGACY_FALLBACK=1.
  */
 import express from 'express';
 import cors    from 'cors';
@@ -23,6 +23,11 @@ const isProd = process.env.NODE_ENV === 'production';
 const PORT = Number(process.env.PORT) || 3001;
 const BASE = 'https://telematics.oasth.gr';
 const OLD_OASTH_GET_STOPS_B = 'https://old.oasth.gr/el/api/getStopsB/?a=1';
+const OSETH_BASE = process.env.OSETH_BASE || 'https://oseth.com.gr';
+const OSETH_LANGUAGE =
+  String(process.env.OSETH_LANGUAGE || 'el').toLowerCase() === 'en' ? 'en' : 'el';
+const OSETH_ROUTE_PAGE_SIZE = Number(process.env.OSETH_ROUTE_PAGE_SIZE) || 500;
+const OSETH_STOP_PAGE_SIZE = Number(process.env.OSETH_STOP_PAGE_SIZE) || 1000;
 const SESSION_REFRESH_MS = 50 * 60 * 1000;
 const OASTH_FETCH_TIMEOUT_MS = Number(process.env.OASTH_FETCH_TIMEOUT_MS) || 8_000;
 const OASTH_FETCH_RETRIES = Math.max(
@@ -34,10 +39,17 @@ const OASTH_FETCH_RETRIES = Math.max(
 const OASTH_FETCH_RETRY_BASE_MS =
   Number(process.env.OASTH_FETCH_RETRY_BASE_MS) || 250;
 
-/** Set `OASTH_LEGACY_ROUTE_POLE_MAP=1` to build short→pole from every route’s `webGetStops` instead of `getStopsB`. */
+function envFlag(name) {
+  return process.env[name] === '1' || String(process.env[name]).toLowerCase() === 'true';
+}
+
+const USE_LEGACY_OASTH_FALLBACK = envFlag('OASTH_LEGACY_FALLBACK');
+
+/** Requires `OASTH_LEGACY_FALLBACK=1`; then set `OASTH_LEGACY_ROUTE_POLE_MAP=1` to crawl every route’s `webGetStops`. */
 const USE_LEGACY_ROUTE_POLE_MAP =
-  process.env.OASTH_LEGACY_ROUTE_POLE_MAP === '1' ||
-  String(process.env.OASTH_LEGACY_ROUTE_POLE_MAP).toLowerCase() === 'true';
+  USE_LEGACY_OASTH_FALLBACK && envFlag('OASTH_LEGACY_ROUTE_POLE_MAP');
+const USE_LEGACY_GET_STOPS_B_POLE_MAP =
+  USE_LEGACY_OASTH_FALLBACK && envFlag('OASTH_LEGACY_GET_STOPS_B_POLE_MAP');
 
 const gunzip = promisify(zlib.gunzip);
 
@@ -315,6 +327,11 @@ function sendError(res, e) {
   res.status(500).json({ error: msg });
 }
 
+function osethOnlyError(label, err) {
+  const detail = err?.message ? `: ${err.message}` : '';
+  return new Error(`${label} unavailable from OSETH and legacy OASTH fallback is disabled${detail}`);
+}
+
 /** `webGetLines` is normally a JSON array; accept wrappers / object-maps. */
 function coerceWebGetLinesRows(raw) {
   if (Array.isArray(raw)) return raw;
@@ -475,6 +492,389 @@ function enrichAllStopsWithPoleIds(data) {
   });
 }
 
+/* ── OSETH API adapter (current public telematics site) ───────────────── */
+
+const OSETH_ROUTE_CODE_SHAPE_SEP = '__shape_';
+
+let osethRoutesCache = null;
+let osethRoutesPromise = null;
+let osethStopsCache = null;
+let osethStopsPromise = null;
+
+function osethHeaders() {
+  return {
+    Accept: 'application/json, text/plain, */*',
+    Referer: `${OSETH_BASE}/${OSETH_LANGUAGE}/search-bus-schedules`,
+    'User-Agent': 'Mozilla/5.0 OASTH-public proxy',
+  };
+}
+
+function compactLineKey(v) {
+  return String(v ?? '')
+    .trim()
+    .toUpperCase()
+    .replace(/^0+(?=\d)/, '');
+}
+
+function makeOsethRouteCode(routeId, shapeId) {
+  const rid = String(routeId ?? '').trim();
+  const sid = String(shapeId ?? '').trim();
+  if (!rid || !sid) return rid;
+  return `${rid}${OSETH_ROUTE_CODE_SHAPE_SEP}${sid}`;
+}
+
+function parseOsethRouteCode(routeCode) {
+  const raw = String(routeCode ?? '').trim();
+  const idx = raw.lastIndexOf(OSETH_ROUTE_CODE_SHAPE_SEP);
+  if (idx <= 0) return null;
+  const routeId = raw.slice(0, idx);
+  const shapeId = raw.slice(idx + OSETH_ROUTE_CODE_SHAPE_SEP.length);
+  if (!routeId || !shapeId) return null;
+  return { routeId, shapeId };
+}
+
+function formatOsethDate(d = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(
+    d.getHours()
+  )}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+async function osethGet(resource, params = {}, label = 'OSETH fetch') {
+  const clean = String(resource).replace(/^\/+/, '');
+  const url = new URL(`/${OSETH_LANGUAGE}/telematics-api/${clean}`, OSETH_BASE);
+  const mergedParams = { language: OSETH_LANGUAGE, ...params };
+  for (const [k, v] of Object.entries(mergedParams)) {
+    if (v == null || v === '') continue;
+    url.searchParams.set(k, String(v));
+  }
+
+  const res = await oasthFetch(
+    url.toString(),
+    { method: 'GET', headers: osethHeaders() },
+    label
+  );
+  const text = await res.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`OSETH non-JSON response (${res.status}): ${text.slice(0, 200)}`);
+  }
+  if (!res.ok || (json.status_code && Number(json.status_code) >= 400)) {
+    const detail = json.error || json.message || text.slice(0, 200);
+    throw new Error(`OSETH ${label} failed (${res.status}): ${detail}`);
+  }
+  return json.data ?? json;
+}
+
+async function fetchOsethRoutes() {
+  if (osethRoutesCache) return osethRoutesCache;
+  if (!osethRoutesPromise) {
+    osethRoutesPromise = (async () => {
+      const data = await osethGet(
+        'route',
+        { page: 1, size: OSETH_ROUTE_PAGE_SIZE },
+        'routes'
+      );
+      const routes = Array.isArray(data.routes) ? data.routes : [];
+      osethRoutesCache = routes;
+      if (!isProd) console.log(`✅ OSETH routes: ${routes.length} rows`);
+      return routes;
+    })().finally(() => {
+      osethRoutesPromise = null;
+    });
+  }
+  return osethRoutesPromise;
+}
+
+async function fetchOsethStops() {
+  if (osethStopsCache) return osethStopsCache;
+  if (!osethStopsPromise) {
+    osethStopsPromise = (async () => {
+      const size = Math.max(1, Math.min(OSETH_STOP_PAGE_SIZE, 1000));
+      const first = await osethGet('stop', { page: 1, size }, 'stops page 1');
+      const firstStops = Array.isArray(first.stops) ? first.stops : [];
+      const total = Number(first.total) || firstStops.length;
+      const pages = Math.max(1, Math.ceil(total / size));
+      const rest = [];
+      for (let page = 2; page <= pages; page++) {
+        rest.push(osethGet('stop', { page, size }, `stops page ${page}`));
+      }
+      const restData = await Promise.all(rest);
+      const stops = [
+        ...firstStops,
+        ...restData.flatMap((p) => (Array.isArray(p.stops) ? p.stops : [])),
+      ];
+      osethStopsCache = stops;
+      if (!isProd) console.log(`✅ OSETH stops: ${stops.length}/${total} rows`);
+      return stops;
+    })().finally(() => {
+      osethStopsPromise = null;
+    });
+  }
+  return osethStopsPromise;
+}
+
+function osethRouteToLineRow(route) {
+  const id = String(route?.id ?? '').trim();
+  const shortName = String(route?.shortName ?? '').trim();
+  const longName = String(route?.longName ?? '').trim();
+  return {
+    LineCode: id,
+    line_code: id,
+    LineID: shortName,
+    LineIDGR: shortName,
+    line_id: shortName,
+    LineDescr: longName,
+    LineDescrEng: longName,
+    routeColor: route?.color,
+    __source: 'oseth',
+  };
+}
+
+function osethStopToAllStopRow(stop) {
+  const id = String(stop?.id ?? stop?.code ?? '').trim();
+  const code = String(stop?.code ?? id).trim();
+  return {
+    id,
+    poleId: code,
+    descr: String(stop?.name ?? '').trim(),
+    street: '',
+    lat: String(stop?.latitude ?? ''),
+    lng: String(stop?.longitude ?? ''),
+    routes: Array.isArray(stop?.routes) ? stop.routes : [],
+    __source: 'oseth',
+  };
+}
+
+function osethHeadsignToRouteRow(route, headsign) {
+  const lineCode = String(route?.id ?? headsign?.routeId ?? '').trim();
+  const routeId = String(headsign?.routeId ?? lineCode).trim();
+  const shapeId = String(headsign?.shapeId ?? '').trim();
+  const shortName = String(route?.shortName ?? '').trim();
+  const longName = String(route?.longName ?? '').trim();
+  const descr = String(headsign?.headsign ?? longName).trim();
+  return {
+    LineCode: lineCode,
+    line_code: lineCode,
+    MasterLineCode: lineCode,
+    LineID: shortName,
+    LineIDGR: shortName,
+    line_id: shortName,
+    LineDescr: longName,
+    LineDescrEng: longName,
+    RouteCode: makeOsethRouteCode(routeId, shapeId),
+    route_code: makeOsethRouteCode(routeId, shapeId),
+    RouteDescr: descr,
+    RouteDescrEng: descr,
+    routeColor: route?.color,
+    __source: 'oseth',
+    __routeId: routeId,
+    __shapeId: shapeId,
+  };
+}
+
+function osethRouteToFallbackRouteRow(route) {
+  const id = String(route?.id ?? '').trim();
+  const shortName = String(route?.shortName ?? '').trim();
+  const longName = String(route?.longName ?? '').trim();
+  return {
+    LineCode: id,
+    line_code: id,
+    MasterLineCode: id,
+    LineID: shortName,
+    LineIDGR: shortName,
+    line_id: shortName,
+    LineDescr: longName,
+    LineDescrEng: longName,
+    RouteCode: id,
+    route_code: id,
+    RouteDescr: longName,
+    RouteDescrEng: longName,
+    routeColor: route?.color,
+    __source: 'oseth',
+  };
+}
+
+async function osethRouteRowsForLine(lineKey) {
+  const key = String(lineKey ?? '').trim();
+  if (!key) return [];
+  const compact = compactLineKey(key);
+  const routes = await fetchOsethRoutes();
+  const matches = routes.filter((route) => {
+    const id = String(route?.id ?? '').trim();
+    const shortName = String(route?.shortName ?? '').trim();
+    return id === key || shortName === key || compactLineKey(shortName) === compact;
+  });
+
+  const rows = [];
+  for (const route of matches) {
+    const heads = Array.isArray(route.tripHeadsigns) ? route.tripHeadsigns : [];
+    if (heads.length === 0) {
+      rows.push(osethRouteToFallbackRouteRow(route));
+      continue;
+    }
+    for (const h of heads) rows.push(osethHeadsignToRouteRow(route, h));
+  }
+  return rows;
+}
+
+function osethRouteInfoToStopsPayload(info, routeCode) {
+  const stops = Array.isArray(info?.stops) ? info.stops : [];
+  const mappedStops = stops.map((stop, idx) => ({
+    StopCode: String(stop?.id ?? stop?.code ?? '').trim(),
+    StopID: String(stop?.code ?? stop?.id ?? '').trim(),
+    StopDescr: String(stop?.name ?? '').trim(),
+    StopDescrEng: String(stop?.name ?? '').trim(),
+    StopLat: String(stop?.latitude ?? ''),
+    StopLng: String(stop?.longitude ?? ''),
+    RouteStopOrder: String(stop?.sequence ?? idx + 1),
+    routeColor: info?.color,
+    __routeCode: routeCode,
+    __source: 'oseth',
+  }));
+  return {
+    RouteCode: routeCode,
+    route_code: routeCode,
+    LineCode: String(info?.id ?? '').trim(),
+    LineID: String(info?.shortName ?? '').trim(),
+    LineDescr: String(info?.longName ?? '').trim(),
+    RouteDescr: String(info?.headsign ?? info?.longName ?? '').trim(),
+    shape: info?.shape,
+    stops: mappedStops,
+    vehicles: Array.isArray(info?.vehicles) ? info.vehicles : [],
+    __source: 'oseth',
+  };
+}
+
+async function fetchOsethRouteDetails(routeCode) {
+  const parsed = parseOsethRouteCode(routeCode);
+  if (!parsed) return null;
+  const info = await osethGet(
+    `route/${encodeURIComponent(parsed.routeId)}/info`,
+    { shapeId: parsed.shapeId },
+    `route ${parsed.routeId} ${parsed.shapeId}`
+  );
+  return osethRouteInfoToStopsPayload(info, routeCode);
+}
+
+function osethStopInfoTripToRouteRow(trip) {
+  const route = trip?.route ?? {};
+  const routeId = String(route.id ?? '').trim();
+  const shapeId = String(trip?.shapeId ?? '').trim();
+  const routeCode = makeOsethRouteCode(routeId, shapeId);
+  const shortName = String(route.shortName ?? '').trim();
+  const longName = String(route.longName ?? '').trim();
+  const headsign = String(trip?.headsign ?? longName).trim();
+  return {
+    LineCode: routeId,
+    line_code: routeId,
+    MasterLineCode: routeId,
+    LineID: shortName,
+    LineIDGR: shortName,
+    line_id: shortName,
+    LineDescr: longName,
+    LineDescrEng: longName,
+    RouteCode: routeCode,
+    route_code: routeCode,
+    RouteDescr: headsign,
+    RouteDescrEng: headsign,
+    routeColor: route.color,
+    __source: 'oseth',
+    __shapeId: shapeId,
+  };
+}
+
+async function osethRoutesForStop(stopCode) {
+  const info = await osethGet(
+    `stop/${encodeURIComponent(stopCode)}/info`,
+    {},
+    `stop ${stopCode} info`
+  );
+  const rows = [];
+  const seen = new Set();
+  for (const trip of Array.isArray(info.trips) ? info.trips : []) {
+    const row = osethStopInfoTripToRouteRow(trip);
+    const key = `${row.RouteCode}:${row.RouteDescr}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push(row);
+  }
+  if (rows.length > 0) return rows;
+  for (const route of Array.isArray(info.routes) ? info.routes : []) {
+    const row = osethRouteToFallbackRouteRow(route);
+    const key = row.RouteCode;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push(row);
+  }
+  return rows;
+}
+
+function osethVehicleToBusLocation(vehicle) {
+  return {
+    VEH_NO: String(vehicle?.id ?? ''),
+    CS_LAT: String(vehicle?.latitude ?? ''),
+    CS_LNG: String(vehicle?.longitude ?? ''),
+    bearing: vehicle?.bearing,
+    __source: 'oseth',
+  };
+}
+
+function osethTripVehicleId(trip) {
+  const v =
+    trip?.vehicle?.id ??
+    trip?.vehicle?.code ??
+    trip?.vehicleId ??
+    trip?.vehicleCode ??
+    trip?.bus?.id;
+  return v == null ? '' : String(v).trim();
+}
+
+function osethTripToArrival(trip) {
+  const route = trip?.route ?? {};
+  const routeId = String(route.id ?? '').trim();
+  const shapeId = String(trip?.shapeId ?? '').trim();
+  const routeCode = makeOsethRouteCode(routeId, shapeId);
+  const mins = trip?.arrivalInMinutes ?? trip?.departureInMinutes;
+  const lineId = String(route.shortName ?? '').trim();
+  const descr = String(trip?.headsign ?? route.longName ?? '').trim();
+  const vehicleId = osethTripVehicleId(trip);
+  const isMonitored = trip?.monitored === true;
+  const isLive = isMonitored;
+  return {
+    btime2: mins == null ? '' : String(Math.max(0, Number(mins) || 0)),
+    route_code: routeCode,
+    RouteCode: routeCode,
+    resolved_route_code: routeCode,
+    line_id: lineId,
+    LineID: lineId,
+    route_descr: descr,
+    RouteDescr: descr,
+    route_descr_eng: descr,
+    RouteDescrEng: descr,
+    veh_no: vehicleId || undefined,
+    VehNo: vehicleId || undefined,
+    is_live: isLive,
+    realtime: isLive,
+    monitored: isMonitored,
+    __arrival_kind: isLive ? 'live' : 'scheduled',
+    __arrival_live_reason: isMonitored ? 'monitored' : '',
+    __vehicle_tracking: vehicleId ? 'present' : '',
+    __source: 'oseth',
+  };
+}
+
+async function osethArrivalsForStop(stopCode) {
+  const data = await osethGet(
+    `stop/${encodeURIComponent(stopCode)}/timetable`,
+    { date: formatOsethDate() },
+    `stop ${stopCode} timetable`
+  );
+  return (Array.isArray(data.trips) ? data.trips : []).map(osethTripToArrival);
+}
+
 /* ── Routes ────────────────────────────────────────────── */
 
 app.get('/health', (_req, res) => {
@@ -486,21 +886,24 @@ let cachedLines = null;
 
 app.post('/api/all-stops', async (req, res) => {
   try {
-    let data;
-    let status = 200;
     if (cachedStops) {
-      data = cachedStops;
-    } else {
-      const token = getToken();
-      const result = await oasthPost('getAllStops', { 'x-csrf-token': token });
-      status = result.status;
-      if (result.data && Array.isArray(result.data)) {
-        cachedStops = result.data;
-      }
-      data = result.data;
+      return res.json(cachedStops);
     }
+    try {
+      const stops = await fetchOsethStops();
+      cachedStops = stops.map(osethStopToAllStopRow);
+      return res.json(cachedStops);
+    } catch (osethErr) {
+      if (!isProd) console.warn('OSETH all-stops failed:', osethErr.message);
+      if (!USE_LEGACY_OASTH_FALLBACK) throw osethOnlyError('all-stops', osethErr);
+    }
+
+    const token = getToken();
+    const result = await oasthPost('getAllStops', { 'x-csrf-token': token });
+    const data = result.data;
+    if (data && Array.isArray(data)) cachedStops = enrichAllStopsWithPoleIds(data);
     const payload = enrichAllStopsWithPoleIds(data);
-    res.status(status).json(payload);
+    res.status(result.status).json(payload);
   } catch (e) {
     sendError(res, e);
   }
@@ -510,6 +913,15 @@ app.post('/api/all-stops', async (req, res) => {
 app.post('/api/all-lines', async (req, res) => {
   try {
     if (cachedLines) return res.json(cachedLines);
+
+    try {
+      const routes = await fetchOsethRoutes();
+      cachedLines = routes.map(osethRouteToLineRow);
+      return res.json(cachedLines);
+    } catch (osethErr) {
+      if (!isProd) console.warn('OSETH all-lines failed:', osethErr.message);
+      if (!USE_LEGACY_OASTH_FALLBACK) throw osethOnlyError('all-lines', osethErr);
+    }
 
     const result = await oasthPost('webGetLines');
     const rows = coerceWebGetLinesRows(result.data);
@@ -524,6 +936,15 @@ app.post('/api/all-lines', async (req, res) => {
 
 app.post('/api/routes/:lineCode', async (req, res) => {
   try {
+    try {
+      const osethRows = await osethRouteRowsForLine(req.params.lineCode);
+      if (osethRows.length > 0) return res.json(osethRows);
+    } catch (osethErr) {
+      if (!isProd) console.warn('OSETH routes failed:', osethErr.message);
+      if (!USE_LEGACY_OASTH_FALLBACK) throw osethOnlyError('routes', osethErr);
+    }
+    if (!USE_LEGACY_OASTH_FALLBACK) return res.json([]);
+
     const p1 = encodeURIComponent(req.params.lineCode);
     const result = await oasthPost(`webGetRoutes&p1=${p1}`);
     res.status(result.status).json(result.data);
@@ -535,6 +956,15 @@ app.post('/api/routes/:lineCode', async (req, res) => {
 /** Same act as official telematics `getRoutesForLine` (line-details route dropdown). */
 app.post('/api/routes-for-line/:lineCode', async (req, res) => {
   try {
+    try {
+      const osethRows = await osethRouteRowsForLine(req.params.lineCode);
+      if (osethRows.length > 0) return res.json(osethRows);
+    } catch (osethErr) {
+      if (!isProd) console.warn('OSETH routes-for-line failed:', osethErr.message);
+      if (!USE_LEGACY_OASTH_FALLBACK) throw osethOnlyError('routes-for-line', osethErr);
+    }
+    if (!USE_LEGACY_OASTH_FALLBACK) return res.json([]);
+
     const p1 = encodeURIComponent(req.params.lineCode);
     const result = await oasthPost(`getRoutesForLine&p1=${p1}`);
     res.status(result.status).json(result.data);
@@ -545,6 +975,15 @@ app.post('/api/routes-for-line/:lineCode', async (req, res) => {
 
 app.post('/api/routes-for-stop/:stopCode', async (req, res) => {
   try {
+    try {
+      const rows = await osethRoutesForStop(req.params.stopCode);
+      if (rows.length > 0) return res.json(rows);
+    } catch (osethErr) {
+      if (!isProd) console.warn('OSETH routes-for-stop failed:', osethErr.message);
+      if (!USE_LEGACY_OASTH_FALLBACK) throw osethOnlyError('routes-for-stop', osethErr);
+    }
+    if (!USE_LEGACY_OASTH_FALLBACK) return res.json([]);
+
     const p1 = encodeURIComponent(req.params.stopCode);
     const result = await oasthPost(`webRoutesForStop&p1=${p1}`);
     res.status(result.status).json(result.data);
@@ -555,6 +994,15 @@ app.post('/api/routes-for-stop/:stopCode', async (req, res) => {
 
 app.post('/api/stops/:routeCode', async (req, res) => {
   try {
+    try {
+      const osethDetails = await fetchOsethRouteDetails(req.params.routeCode);
+      if (osethDetails) return res.json(osethDetails.stops);
+    } catch (osethErr) {
+      if (!isProd) console.warn('OSETH stops failed:', osethErr.message);
+      if (!USE_LEGACY_OASTH_FALLBACK) throw osethOnlyError('stops', osethErr);
+    }
+    if (!USE_LEGACY_OASTH_FALLBACK) return res.json([]);
+
     const p1 = encodeURIComponent(req.params.routeCode);
     const result = await oasthPost(`webGetStops&p1=${p1}`);
     res.status(result.status).json(result.data);
@@ -565,6 +1013,17 @@ app.post('/api/stops/:routeCode', async (req, res) => {
 
 app.post('/api/bus-locations/:routeCode', async (req, res) => {
   try {
+    try {
+      const osethDetails = await fetchOsethRouteDetails(req.params.routeCode);
+      if (osethDetails) {
+        return res.json(osethDetails.vehicles.map(osethVehicleToBusLocation));
+      }
+    } catch (osethErr) {
+      if (!isProd) console.warn('OSETH bus-locations failed:', osethErr.message);
+      if (!USE_LEGACY_OASTH_FALLBACK) throw osethOnlyError('bus-locations', osethErr);
+    }
+    if (!USE_LEGACY_OASTH_FALLBACK) return res.json([]);
+
     const token = getToken();
     const p1 = encodeURIComponent(req.params.routeCode);
     const result = await oasthPost(`getBusLocation&p1=${p1}`, {
@@ -578,6 +1037,14 @@ app.post('/api/bus-locations/:routeCode', async (req, res) => {
 
 app.post('/api/arrivals/:stopCode', async (req, res) => {
   try {
+    try {
+      const osethRows = await osethArrivalsForStop(req.params.stopCode);
+      return res.json(dedupeStopArrivals(osethRows));
+    } catch (osethErr) {
+      if (!isProd) console.warn('OSETH arrivals failed:', osethErr.message);
+      if (!USE_LEGACY_OASTH_FALLBACK) throw osethOnlyError('arrivals', osethErr);
+    }
+
     const token = getToken();
     const stopCode = req.params.stopCode;
     const p1 = encodeURIComponent(stopCode);
@@ -602,6 +1069,41 @@ app.post('/api/stop-by-sip/:sip', async (req, res) => {
       return res.status(400).json({ error: 'Invalid sip parameter' });
     }
     const sip = raw.replace(/\s+/g, '');
+    try {
+      const stop = await osethGet(
+        `stop/${encodeURIComponent(sip)}/info`,
+        {},
+        `stop ${sip} info`
+      );
+      if (stop?.id != null) {
+        return res.json({
+          id: String(stop.id),
+          code: String(stop.code ?? stop.id),
+          titleel: String(stop.name ?? ''),
+          titleen: String(stop.name ?? ''),
+          descr: String(stop.name ?? ''),
+          lat: String(stop.latitude ?? ''),
+          lng: String(stop.longitude ?? ''),
+          routes: Array.isArray(stop.routes) ? stop.routes : [],
+          __source: 'oseth',
+        });
+      }
+    } catch (osethErr) {
+      if (!isProd) console.warn('OSETH stop-by-sip failed:', osethErr.message);
+      if (!USE_LEGACY_OASTH_FALLBACK) {
+        return res.status(404).json({
+          error: 'Stop not found in OSETH data',
+          code: 'OSETH_STOP_NOT_FOUND',
+        });
+      }
+    }
+    if (!USE_LEGACY_OASTH_FALLBACK) {
+      return res.status(404).json({
+        error: 'Stop not found in OSETH data',
+        code: 'OSETH_STOP_NOT_FOUND',
+      });
+    }
+
     const result = await oasthPost(`getStopBySIP&sip=${encodeURIComponent(sip)}`);
     res.status(result.status).json(result.data);
   } catch (e) {
@@ -612,6 +1114,20 @@ app.post('/api/stop-by-sip/:sip', async (req, res) => {
 /** Route metadata + `stops` array (same rows as webGetStops) in one call. */
 app.post('/api/route-details-stops/:routeCode', async (req, res) => {
   try {
+    try {
+      const osethDetails = await fetchOsethRouteDetails(req.params.routeCode);
+      if (osethDetails) return res.json(osethDetails);
+    } catch (osethErr) {
+      if (!isProd) console.warn('OSETH route-details-stops failed:', osethErr.message);
+      if (!USE_LEGACY_OASTH_FALLBACK) throw osethOnlyError('route-details-stops', osethErr);
+    }
+    if (!USE_LEGACY_OASTH_FALLBACK) {
+      return res.status(404).json({
+        error: 'Route details not found in OSETH data',
+        code: 'OSETH_ROUTE_NOT_FOUND',
+      });
+    }
+
     const p1 = encodeURIComponent(req.params.routeCode);
     const result = await oasthPost(`webGetRoutesDetailsAndStops&p1=${p1}`);
     res.status(result.status).json(result.data);
@@ -637,14 +1153,19 @@ if (isProd && fs.existsSync(distPath)) {
 app.listen(PORT, () => {
   const mode = isProd ? 'production' : 'development';
   console.log(`OASTH proxy on http://localhost:${PORT} (${mode})`);
-  ensureSession()
-    .then(() => {
-      const build = USE_LEGACY_ROUTE_POLE_MAP
-        ? buildStopPoleMap()
-        : buildStopPoleMapFromGetStopsB();
-      return build.catch((e) =>
-        console.error('Stop pole map build failed:', e.message)
-      );
-    })
-    .catch((e) => console.error('Session warm-up failed:', e.message));
+  fetchOsethRoutes().catch((e) =>
+    console.error('OSETH route warm-up failed:', e.message)
+  );
+  if (USE_LEGACY_ROUTE_POLE_MAP || USE_LEGACY_GET_STOPS_B_POLE_MAP) {
+    ensureSession()
+      .then(() => {
+        const build = USE_LEGACY_ROUTE_POLE_MAP
+          ? buildStopPoleMap()
+          : buildStopPoleMapFromGetStopsB();
+        return build.catch((e) =>
+          console.error('Legacy stop pole map build failed:', e.message)
+        );
+      })
+      .catch((e) => console.error('Legacy session warm-up failed:', e.message));
+  }
 });
